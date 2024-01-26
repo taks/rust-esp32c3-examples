@@ -12,6 +12,7 @@ use esp_idf_svc::nvs::{EspNvs, EspNvsPartition, NvsDefault};
 use esp_idf_sys as _;
 use futures::{channel::mpsc::channel, join, StreamExt};
 use log::{info, warn};
+use serde::de;
 use std::{
     rc::Rc,
     sync::{Arc, RwLock},
@@ -80,12 +81,10 @@ async fn main_async() {
     });
 
     let ble_advertising = device.get_advertising();
-    let device = Rc::new(RwLock::new(device));
 
     ble_advertising
         .name(name.as_str())
         .add_service_uuid(SERVICE_UUID);
-    let ble_advertising = Arc::new(RwLock::new(ble_advertising));
 
     let service = server.create_service(SERVICE_UUID);
 
@@ -102,25 +101,19 @@ async fn main_async() {
     );
     let set_short_name = {
         let short_name_characteristic = short_name_characteristic.clone();
-        let ble_advertising = ble_advertising.clone();
         let ref nvs = nvs;
         move |new_name: &str| {
             nvs.write()
                 .unwrap()
                 .set_str(NVS_TAG_SHORT_NAME, new_name)
                 .unwrap();
-            ble_advertising.write().unwrap().reset().unwrap();
+            let ble_advertising = device.get_advertising();
+            ble_advertising.reset().unwrap();
             ble_advertising
-                .write()
-                .unwrap()
                 .name(new_name)
                 .add_service_uuid(SERVICE_UUID)
                 .start()
                 .unwrap();
-            short_name_characteristic
-                .lock()
-                .set_value(new_name.as_bytes())
-                .notify();
         }
     };
     short_name_characteristic
@@ -129,7 +122,10 @@ async fn main_async() {
         .on_write(
             move |args| match String::from_utf8(args.recv_data.to_vec()) {
                 Ok(short_name) => match validate_short_name(&short_name) {
-                    Ok(_) => set_short_name(&short_name),
+                    Ok(_) => {
+                        args.notify();
+                        set_short_name(&short_name);
+                    } ,
                     Err(message) => warn!("{}", message),
                 },
                 Err(e) => {
@@ -169,7 +165,7 @@ async fn main_async() {
         );
     let set_passkey = {
         |passkey| {
-            device.write().unwrap().security().set_passkey(passkey);
+            BLEDevice::take().security().set_passkey(passkey);
             nvs.write()
                 .unwrap()
                 .set_u32(NVS_TAG_PASSKEY, passkey)
@@ -183,7 +179,7 @@ async fn main_async() {
 
     ::log::info!(
         "bonded_addresses: {:?}",
-        device.read().unwrap().bonded_addresses().unwrap()
+        device.bonded_addresses().unwrap()
     );
 
     join!(
@@ -195,7 +191,7 @@ async fn main_async() {
         ),
         async {
             while let Some(_) = advertise_rx.next().await {
-                device.write().unwrap().get_advertising().start().unwrap();
+                device.get_advertising().start().unwrap();
             }
         },
         async {
