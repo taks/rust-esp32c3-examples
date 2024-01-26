@@ -56,7 +56,7 @@ async fn main_async() {
     };
     info!("Passkey is: {:0>6}", passkey);
 
-    let nvs = RwLock::new(nvs);
+    let nvs = Arc::new(RwLock::new(nvs));
 
     let device = BLEDevice::take();
     device
@@ -99,41 +99,50 @@ async fn main_async() {
             | NimbleProperties::WRITE_AUTHEN
             | NimbleProperties::NOTIFY,
     );
+
     let set_short_name = {
+        let nvs = nvs.clone();
         let short_name_characteristic = short_name_characteristic.clone();
-        let ref nvs = nvs;
+
         move |new_name: &str| {
             nvs.write()
                 .unwrap()
                 .set_str(NVS_TAG_SHORT_NAME, new_name)
                 .unwrap();
-            let ble_advertising = device.get_advertising();
+            let ble_advertising = BLEDevice::take().get_advertising();
             ble_advertising.reset().unwrap();
             ble_advertising
                 .name(new_name)
                 .add_service_uuid(SERVICE_UUID)
                 .start()
                 .unwrap();
+            short_name_characteristic
+                .lock()
+                .set_value(new_name.as_bytes())
+                .notify();
         }
     };
-    short_name_characteristic
-        .lock()
-        .set_value(name.as_bytes())
-        .on_write(
-            move |args| match String::from_utf8(args.recv_data.to_vec()) {
-                Ok(short_name) => match validate_short_name(&short_name) {
-                    Ok(_) => {
-                        args.notify();
-                        set_short_name(&short_name);
-                    } ,
-                    Err(message) => warn!("{}", message),
+    let set_short_name = Arc::new(esp32_nimble::utilities::mutex::Mutex::new(set_short_name));
+    {
+        let set_short_name = set_short_name.clone();
+        short_name_characteristic
+            .lock()
+            .set_value(name.as_bytes())
+            .on_write(
+                move |args| match String::from_utf8(args.recv_data.to_vec()) {
+                    Ok(short_name) => match validate_short_name(&short_name) {
+                        Ok(_) => {
+                            set_short_name.lock()(&short_name);
+                        } ,
+                        Err(message) => warn!("{}", message),
+                    },
+                    Err(e) => {
+                        args.reject();
+                        warn!("Invalid short_name. Error: {:#?}", e);
+                    }
                 },
-                Err(e) => {
-                    args.reject();
-                    warn!("Invalid short_name. Error: {:#?}", e);
-                }
-            },
-        );
+            );
+    }
 
     let (mut passkey_tx, mut passkey_rx) = channel::<u32>(0);
     let passkey_characteristic = service.lock().create_characteristic(
@@ -185,7 +194,7 @@ async fn main_async() {
     join!(
         process_stdin(
             &short_name_characteristic,
-            &set_short_name,
+            set_short_name.clone(),
             &passkey_characteristic,
             &set_passkey
         ),
@@ -196,7 +205,7 @@ async fn main_async() {
         },
         async {
             while let Some(short_name) = short_name_rx.next().await {
-                set_short_name(&short_name);
+                set_short_name.lock()(&short_name);
             }
         },
         async {
